@@ -1,12 +1,13 @@
+#include "socket/socket.hpp"
+#include "socket/platform.hpp"
+
+#include "request-handler/client_handler.hpp"
+#include "request-handler/net_io.hpp"
+
 #include <iostream>
-#include <cstdlib>
+#include <utility>
 #include <string>
-
-#include <winsock2.h>   // Declares the socket functions (socket, bind, closesocket, ...) and types (SOCKET, WSADATA).
-#include <WS2tcpip.h>   // extra helpers for IP addresses and name lookup | getaddrinfo, inet_ntop
-
-
-constexpr size_t kMaxRequestSize = 16384;
+#include <cstdlib>
 
 bool tryParsePort(const char* text, unsigned short& outPort) {
     // 1. If the text is null or empty, return false.
@@ -36,115 +37,6 @@ bool tryParsePort(const char* text, unsigned short& outPort) {
     return true;
 }
 
-enum class RequestResult {Complete, ClientClosed, Error, TooLarge};
-
-
-/*
-SendAll()
-*/
-bool sendAll(SOCKET clientSocket, const std::string& data){
-    int iBytesSentCnt = 0;
-    int iDataSize = static_cast<int>(data.size());
-
-    while(iBytesSentCnt < iDataSize) 
-    {
-        const char* remainingDataPtr = data.c_str() + iBytesSentCnt;
-        int remainingLength = static_cast<int>(iDataSize - iBytesSentCnt);
-
-        int result = send(clientSocket, remainingDataPtr, remainingLength, 0);
-        
-        if (result == SOCKET_ERROR) {
-            std::cerr << "Winsock error occurred: " << WSAGetLastError() << std::endl;
-            return false;
-        }
-
-        iBytesSentCnt += result;
-    }
-
-    return true;
-}
-
-/*
-receiveRequest()
-*/
-RequestResult receiveRequest(SOCKET clientSocket, std::string& outputString){
-    char receiveBuffer[4096];
-
-    while(true){
-        int iBytesReceived = recv(clientSocket, receiveBuffer, sizeof(receiveBuffer), 0);
-
-        if (iBytesReceived == SOCKET_ERROR) {
-            std::cerr << "Winsock error occurred: " << WSAGetLastError() << std::endl;
-            return RequestResult::Error;
-        }
-        
-        if(iBytesReceived == 0)
-        {   
-            std::cout << "Client closed the connection" << std::endl;
-            return RequestResult::ClientClosed;
-        }
-        
-        outputString.append(receiveBuffer, iBytesReceived);
-
-        if(outputString.find("\r\n\r\n") != std::string::npos)
-        {
-            return RequestResult::Complete;
-        }
-
-        if (outputString.size() > kMaxRequestSize) {
-            return RequestResult::TooLarge;
-        }
-    }
-}
-
-/*
-HandleClient()
-*/
-void handleClient(SOCKET clientSocket, std::string& outputString){
-    RequestResult result = receiveRequest(clientSocket,outputString);
-
-    if(result != RequestResult::Complete){
-        std::cout << "Request is not complete." << std::endl;
-        return;
-    }
-
-    std::cout << outputString << std::endl;
-
-    std::string responseBody;
-    std::string responseHeader;
-    std::string fullResponse;
-
-    responseBody = R"=====(
-        <html>
-            <body>
-                <h1>Hello, Omkar</h1>
-                <p>Hello from my C++ server</p>
-            </body>
-        </html>
-    )=====";
-    
-    std::string contentLength = std::to_string(responseBody.size());
-    responseHeader =  {
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: " + contentLength + "\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    };
-    
-    fullResponse = responseHeader + responseBody;
-    
-
-    bool isSuccess = sendAll(clientSocket, fullResponse);
-
-    if(isSuccess == false){
-        std::cout << "Bytes not sent." << std::endl;
-        return;
-    }
-
-    std::cout << "Bytes sent : " << fullResponse.size() << std::endl;
-}
-
 int main(int argc, char* argv[]) {
 
     // Default port number
@@ -159,22 +51,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // START
-    WSADATA wsaData;                // initialises the Winsock library inside process
-    int startupResult = WSAStartup(MAKEWORD(2,2), &wsaData);  //int WSAStartup(WORD wVersionRequired(IN), LPWSADATA lpWSAData(OUT));
+    // WSA start
+    NetworkSession wsaSession;
 
     // WSADATA not initialiaze
-    if(startupResult != 0) {
-        std::cout << "Error comes while initialising WSADATA. | Error -> " << startupResult << std::endl;
+    if(!wsaSession.isWSAInitialized()){
+        std::cout << "Error comes while initialising WSADATA. | Error -> " << wsaSession.wsaStartUpResult() << std::endl;
         std::cin.get();
         return 1;
     }
 
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);   // param = socket(int domain, int type, int protocol);
+    Socket serverSocket(socket(AF_INET, SOCK_STREAM, 0));
 
-    if(serverSocket == INVALID_SOCKET) {
-        std::cout << "Error comes while initialising socket connection. | Error -> " << WSAGetLastError() << std::endl;
-        WSACleanup();
+    if(!serverSocket.valid()){
+        std::cout << "Error comes while initialising server socket connection. | Error -> " << WSAGetLastError() << std::endl;
         std::cin.get();
         return 1;
     }
@@ -186,23 +76,19 @@ int main(int argc, char* argv[]) {
     serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     
     sockaddr* serverAddressPtr = reinterpret_cast<sockaddr*>(&serverAddress);
-    int iBindResult = bind(serverSocket,serverAddressPtr, sizeof(serverAddress));
+    int iBindResult = bind(serverSocket.get(),serverAddressPtr, sizeof(serverAddress));
 
     // Bind fails
     if(iBindResult == SOCKET_ERROR){
         std::cout << "Error comes while binding socket connection. | Error -> " << WSAGetLastError() << std::endl;
-        closesocket(serverSocket);
-        WSACleanup();
         std::cin.get();
         return 1;
     }
 
     // Listening...
-    int iListenResult = listen(serverSocket, SOMAXCONN);
+    int iListenResult = listen(serverSocket.get(), SOMAXCONN);
     if(iListenResult == SOCKET_ERROR){
         std::cout << "Error comes while listening socket connection. | Error -> " << WSAGetLastError() << std::endl;
-        closesocket(serverSocket);
-        WSACleanup();
         std::cin.get();
         return 1;
     }
@@ -220,11 +106,11 @@ int main(int argc, char* argv[]) {
         sockaddr* clientAddressPtr = reinterpret_cast<sockaddr*>(&clientAddress);
         int iClientAddressLength = sizeof(clientAddress);
         
-        // Client socket created.
-        SOCKET clientSocket = accept(serverSocket, clientAddressPtr, &iClientAddressLength);
+        // Client socket created. | Via Socket ctor.
+        Socket clientSocket(accept(serverSocket.get(), clientAddressPtr, &iClientAddressLength));
     
         // Invalid socket
-        if(clientSocket == INVALID_SOCKET){
+        if(!clientSocket.valid()){
             std::cout << "Invalid client socket. | Error -> " << WSAGetLastError() << std::endl;
             continue;
         }
@@ -234,12 +120,11 @@ int main(int argc, char* argv[]) {
         
         std::string outputString;
         handleClient(clientSocket, outputString);
-        closesocket(clientSocket);        
+        // closesocket(clientSocket.get());        
     }
 
     std::cout << "Press enter to exit..." << std::endl;
     std::cin.get();
-    closesocket(serverSocket);
-    WSACleanup();
     return 0;
+
 }
