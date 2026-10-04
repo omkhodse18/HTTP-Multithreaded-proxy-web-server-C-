@@ -6,6 +6,8 @@
 #include <WS2tcpip.h>   // extra helpers for IP addresses and name lookup | getaddrinfo, inet_ntop
 
 
+constexpr size_t kMaxRequestSize = 16384;
+
 bool tryParsePort(const char* text, unsigned short& outPort) {
     // 1. If the text is null or empty, return false.
     if (text == nullptr || text[0] == '\0') {
@@ -32,6 +34,115 @@ bool tryParsePort(const char* text, unsigned short& outPort) {
     // store it in the output parameter, and return true.
     outPort = static_cast<unsigned short>(parsedValue);
     return true;
+}
+
+enum class RequestResult {Complete, ClientClosed, Error, TooLarge};
+
+
+/*
+SendAll()
+*/
+bool sendAll(SOCKET clientSocket, const std::string& data){
+    int iBytesSentCnt = 0;
+    int iDataSize = static_cast<int>(data.size());
+
+    while(iBytesSentCnt < iDataSize) 
+    {
+        const char* remainingDataPtr = data.c_str() + iBytesSentCnt;
+        int remainingLength = static_cast<int>(iDataSize - iBytesSentCnt);
+
+        int result = send(clientSocket, remainingDataPtr, remainingLength, 0);
+        
+        if (result == SOCKET_ERROR) {
+            std::cerr << "Winsock error occurred: " << WSAGetLastError() << std::endl;
+            return false;
+        }
+
+        iBytesSentCnt += result;
+    }
+
+    return true;
+}
+
+/*
+receiveRequest()
+*/
+RequestResult receiveRequest(SOCKET clientSocket, std::string& outputString){
+    char receiveBuffer[4096];
+
+    while(true){
+        int iBytesReceived = recv(clientSocket, receiveBuffer, sizeof(receiveBuffer), 0);
+
+        if (iBytesReceived == SOCKET_ERROR) {
+            std::cerr << "Winsock error occurred: " << WSAGetLastError() << std::endl;
+            return RequestResult::Error;
+        }
+        
+        if(iBytesReceived == 0)
+        {   
+            std::cout << "Client closed the connection" << std::endl;
+            return RequestResult::ClientClosed;
+        }
+        
+        outputString.append(receiveBuffer, iBytesReceived);
+
+        if(outputString.find("\r\n\r\n") != std::string::npos)
+        {
+            return RequestResult::Complete;
+        }
+
+        if (outputString.size() > kMaxRequestSize) {
+            return RequestResult::TooLarge;
+        }
+    }
+}
+
+/*
+HandleClient()
+*/
+void handleClient(SOCKET clientSocket, std::string& outputString){
+    RequestResult result = receiveRequest(clientSocket,outputString);
+
+    if(result != RequestResult::Complete){
+        std::cout << "Request is not complete." << std::endl;
+        return;
+    }
+
+    std::cout << outputString << std::endl;
+
+    std::string responseBody;
+    std::string responseHeader;
+    std::string fullResponse;
+
+    responseBody = R"=====(
+        <html>
+            <body>
+                <h1>Hello, Omkar</h1>
+                <p>Hello from my C++ server</p>
+            </body>
+        </html>
+    )=====";
+    
+    std::string contentLength = std::to_string(responseBody.size());
+    responseHeader =  {
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: " + contentLength + "\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    };
+    
+    fullResponse = responseHeader + responseBody;
+    
+
+    bool isSuccess = sendAll(clientSocket, fullResponse);
+
+    if(isSuccess == false){
+        std::cout << "Bytes not sent." << std::endl;
+        return;
+    }
+
+    std::cout << "Bytes sent : " << fullResponse.size() << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -99,95 +210,34 @@ int main(int argc, char* argv[]) {
     std::cout << "Listening on 127.0.0.1:" << port_number << std::endl;
     std::cout << "Waiting for a client..." << std::endl;
 
-    // accepting
-    sockaddr_in clientAddress{};
-    sockaddr* clientAddressPtr = reinterpret_cast<sockaddr*>(&clientAddress);
-    int iClientAddressLength = sizeof(clientAddress);
-    
-    SOCKET clientSocket = accept(serverSocket, clientAddressPtr, &iClientAddressLength);
+    // Handle many requests..
+    bool bKeepRunning = true;
 
-    // Invalid socket
-    if(clientSocket == INVALID_SOCKET){
-        std::cout << "Invalid client socket. | Error -> " << WSAGetLastError() << std::endl;
-        closesocket(serverSocket);
-        WSACleanup();
-        std::cin.get();
-        return 1;
-    }
-
-    std::cout << "Client connected." << std::endl;
-
-    // Recv
-    char receiveBuffer[4096];
-    int iBytesReceived = recv(clientSocket, receiveBuffer, sizeof(receiveBuffer)-1, 0);
-    
-    if(iBytesReceived == SOCKET_ERROR)
+    while(bKeepRunning)
     {
-        std::cout << "Bytes not received. | Error -> " << WSAGetLastError() << std::endl;
-        closesocket(clientSocket);
-        closesocket(serverSocket);
-        WSACleanup();
-        std::cin.get();
-        return 1;
-    }
-    else if(iBytesReceived == 0)
-    {
-        std::cout << "Client closed the connection" << std::endl;
-    }
-    else if(iBytesReceived > 0)
-    {
-        receiveBuffer[iBytesReceived] = '\0';
-        std::cout << iBytesReceived << std::endl;
-        std::cout << receiveBuffer << std::endl;
-
-
-        std::string responseBody;
-        std::string responseHeader;
-        std::string fullResponse;
-
-        responseBody = R"=====(
-            <html>
-                <body>
-                    <h1>Hello, Omkar</h1>
-                    <p>Hello from my C++ server</p>
-                </body>
-            </html>
-        )=====";
-
-        std::string contentLength = std::to_string(responseBody.size());
-        responseHeader =  {
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: " + contentLength + "\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        };
-
-        fullResponse = responseHeader + responseBody;
-
-        int fullResponseLen = static_cast<int>(fullResponse.size());
-        int iBytesSent = send(clientSocket, fullResponse.c_str(), fullResponseLen, 0);
+        // Accepting..
+        sockaddr_in clientAddress{};
+        sockaddr* clientAddressPtr = reinterpret_cast<sockaddr*>(&clientAddress);
+        int iClientAddressLength = sizeof(clientAddress);
         
-        if(fullResponseLen != iBytesSent) {
-            std::cout << "[WARNING] | Buffer and bytes sent size is different." << std::endl;
+        // Client socket created.
+        SOCKET clientSocket = accept(serverSocket, clientAddressPtr, &iClientAddressLength);
+    
+        // Invalid socket
+        if(clientSocket == INVALID_SOCKET){
+            std::cout << "Invalid client socket. | Error -> " << WSAGetLastError() << std::endl;
+            continue;
         }
-
-        if(iBytesSent == SOCKET_ERROR){
-            std::cout << "Bytes not sent. | Error -> " << WSAGetLastError() << std::endl;
-            closesocket(clientSocket);
-            closesocket(serverSocket);
-            WSACleanup();
-            std::cin.get();
-            return 1;
-        }
-
-        std::cout << "Bytes sent : " << iBytesSent << std::endl;
-
+        
+        // Client connected
+        std::cout << "Client connected." << std::endl;
+        
+        std::string outputString;
+        handleClient(clientSocket, outputString);
+        closesocket(clientSocket);        
     }
-
 
     std::cout << "Press enter to exit..." << std::endl;
-    closesocket(clientSocket);
     std::cin.get();
     closesocket(serverSocket);
     WSACleanup();
