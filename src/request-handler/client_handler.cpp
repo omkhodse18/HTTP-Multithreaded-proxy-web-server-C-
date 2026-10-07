@@ -38,10 +38,35 @@ void handleClient(const Socket& clientSocket, std::string& outputString){
     }
     else{
         RequestLine outline;
+        HeaderMap outHeaders;
+        bool isBadRequest = false;
+        bool isHeaderParsed = false;
 
-        bool isParseSuccessful = parseRequestLine(outputString, outline);
-    
-        if(!isParseSuccessful) 
+        bool isRequestLineParsed = parseRequestLine(outputString, outline);
+        
+        if(isRequestLineParsed){
+            // Print request line if parsed successfully.
+            std::cout << "Request line -> "<< outline.method << " " << outline.target << " " << outline.version << std::endl;
+            isHeaderParsed = parseHeaders(outputString, outHeaders);
+        }
+        
+        if(isHeaderParsed) {
+            if(outline.version == "HTTP/1.1" && outHeaders.find("host")==outHeaders.end() ){
+                isBadRequest = true;
+            }
+            else{
+                auto it = outHeaders.find("host"); 
+                if(it != outHeaders.end()){
+                    std::cout << it->first << " " << it->second << std::endl; 
+                }
+            }
+        }
+        
+        if(!isRequestLineParsed || !isHeaderParsed){
+            isBadRequest = true;
+        }
+        
+        if(isBadRequest) 
         {
             fullResponse = makeResponse(
                 400,
@@ -72,11 +97,7 @@ void handleClient(const Socket& clientSocket, std::string& outputString){
                 "<html><body><h1>404 Not Found</h1></body></html>"
             );
         }
-
-        // Print request line
-        if(isParseSuccessful)
-            std::cout << "Request line -> "<< outline.method << " " << outline.target << " " << outline.version << std::endl;
-    }
+    }   
 
     bool isSuccess = sendAll(clientSocket, fullResponse);
 
